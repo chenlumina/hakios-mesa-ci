@@ -1,0 +1,77 @@
+name: mesa-ios
+on:
+  workflow_dispatch:
+    inputs:
+      drivers:
+        description: 'gallium drivers'
+        default: 'softpipe,freedreno'
+  push:
+    paths: ['.github/workflows/mesa.yml']
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld llvm meson ninja-build bison flex \
+            python3 python3-venv python3-pip pkg-config git curl xz-utils \
+            libncurses-dev uuid-dev zlib1g-dev libssl-dev
+
+      - name: theos + iPhoneOS16.5 SDK
+        run: |
+          set -eux
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          git clone -q --depth 1 --recursive https://github.com/theos/theos "$RUNNER_TEMP/theos"
+          mkdir -p "$RUNNER_TEMP/theos/toolchain"
+          curl -fsSL -o /tmp/tc.tar.xz https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz
+          tar -xJf /tmp/tc.tar.xz -C "$RUNNER_TEMP/theos/toolchain/"
+          ls "$RUNNER_TEMP/theos/toolchain/"
+          cd "$RUNNER_TEMP"
+          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git sdks
+          cd sdks && git sparse-checkout set iPhoneOS16.5.sdk
+          mkdir -p "$RUNNER_TEMP/theos/sdks"
+          cp -r iPhoneOS16.5.sdk "$RUNNER_TEMP/theos/sdks/"
+          du -sh "$RUNNER_TEMP/theos/sdks/iPhoneOS16.5.sdk"
+
+      - name: wire the cross compiler
+        run: |
+          set -eux
+          ls xnu-deps/host/bin/
+          ln -sf "$THEOS/toolchain/linux/iphone/bin/ld" xnu-deps/host/bin/ld64
+          ln -sf xnu-clang xnu-deps/host/bin/xnu-clang++
+          chmod +x xnu-deps/host/bin/xnu-clang xnu-deps/host/bin/xnu-clang++
+          ln -sf "$(command -v llvm-ar)" xnu-deps/host/bin/llvm-ar || true
+          echo "--- 试编译一个空文件 ---"
+          printf 'int x;\n' > /tmp/t.c
+          xnu-deps/host/bin/xnu-clang -c /tmp/t.c -o /tmp/t.o
+          file /tmp/t.o
+
+      - name: build Mesa
+        run: |
+          set -eux
+          export PATH="$THEOS/toolchain/linux/iphone/bin:$PATH"
+          . ./xnu-env.sh
+          export THEOS="$THEOS"
+          export XNU_SDK_VERSION=16.5
+          DRIVERS="${{ inputs.drivers || 'softpipe,freedreno' }}" bash tools/mk-mesa.sh 2>&1 | tail -60
+
+      - name: report
+        if: always()
+        run: |
+          ls -lh xnu-deps/build/mesa/out/ || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-ios-16.5
+          path: |
+            xnu-deps/build/mesa/out/libOSMesa.8.dylib
+            xnu-deps/build/mesa/out/exported-gl.txt
+            xnu-deps/build/mesa/out/gl.xml
+            xnu-deps/build/mesa/*.log
+          if-no-files-found: warn
